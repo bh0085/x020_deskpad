@@ -82,13 +82,18 @@ final class AndroidMirrors {
         sorted.map { "\($0.device.name) (\($0.device.usb ? "USB" : "Wi-Fi"))" + (stateNote($0.device.key).map { ", " + $0 } ?? "") }
     }
 
-    // Wake a sleeping phone (KEYCODE_WAKEUP does nothing to a phone that is already awake).
+    // A click on a phone's panel: wake it (KEYCODE_WAKEUP does nothing to a phone that is already awake) and, if the
+    // lock screen is up, dismiss it the way a swipe would. When Extend Unlock is keeping the phone unlocked that lands
+    // on the phone's last screen; otherwise the phone shows its own fingerprint/PIN prompt. At most once per 2 s.
+    private var lastWake: [String: Date] = [:]
     func wake(_ key: String) {
-        guard let m = mirrors[key], m.connected, m.awake != true else { return }
+        guard let m = mirrors[key], m.connected, Date().timeIntervalSince(lastWake[key] ?? .distantPast) > 2 else { return }
+        lastWake[key] = Date()
         let serial = m.device.adbSerial
-        log("Android: waking \(m.device.name)")
+        if m.awake != true { log("Android: waking \(m.device.name)") }
         adbQueue.async {
-            _ = self.run(Config.adb, ["-s", serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP"])
+            _ = self.run(Config.adb, ["-s", serial, "shell",
+                "input keyevent KEYCODE_WAKEUP; dumpsys window | grep -q isKeyguardShowing=true && wm dismiss-keyguard; true"])
             DispatchQueue.main.async { self.checkPower() }
         }
     }
@@ -201,6 +206,7 @@ final class AndroidMirrors {
             if stateChanged { onStateChange?() }
             relaunchStopped()
         }
+        missingApproved = mirrors.values.contains { !$0.connected }
     }
 
     // Place each mirror (frames on the mirrors display, by device key); start scrcpy where it is not running.
@@ -329,8 +335,9 @@ final class AndroidMirrors {
     // approved this Mac are left alone: connecting would put an "Allow debugging?" prompt on their screen.
     // The approval given over USB covers Wi-Fi too; no pairing needed.
     private var nextScan = Date.distantPast
+    var missingApproved = false   // set on the main queue: an approved phone has dropped off adb
     private func connectWireless(listed: Set<String>) {
-        guard Date() >= nextScan else { return }
+        guard Date() >= nextScan || missingApproved else { return }   // a lost phone: look on every poll (3 s)
         nextScan = Date().addingTimeInterval(10)
         guard let out = run(Config.adb, ["mdns", "services"]) else { return }
         let known = approved
