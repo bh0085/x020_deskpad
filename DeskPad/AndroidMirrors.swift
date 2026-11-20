@@ -1,8 +1,8 @@
 import AppKit
 
 // Android devices connected over adb (USB or Wi-Fi debugging), each mirrored with scrcpy
-// (github.com/Genymobile/scrcpy) in a borderless window on the virtual display, in the layout's mirror row.
-// Mirrors come and go with the devices and follow rotation.
+// (github.com/Genymobile/scrcpy) in a borderless window on the mirrors display; a panel on Desktop 2 shows each one.
+// Mirrors come and go with the devices and follow rotation and folding.
 // scrcpy runs with SDL_MAC_BACKGROUND_APP=1, so starting it never takes focus from Ben, and with
 // SDL_MAC_MOUSE_FOCUS_CLICKTHROUGH=1, so a click on a mirror reaches the phone even while scrcpy is in the background.
 // --no-power-on keeps a DeskPad start from waking every phone.
@@ -11,6 +11,7 @@ final class AndroidMirrors {
         let adbSerial: String   // adb's name for it: USB serial, ip:port, or Wi-Fi debugging name
         let key: String         // hardware serial, so a phone on USB and Wi-Fi at once gets one mirror
         let model: String
+        let name: String        // the name set on the phone (Settings > About), e.g. "Galaxy Z Fold7"
         let usb: Bool
         var aspect: CGFloat     // width / height of the screen as currently rotated
     }
@@ -21,7 +22,7 @@ final class AndroidMirrors {
         var frame: CGRect = .zero
         var launches: [Date] = []
         init(device: Device) { self.device = device }
-        var title: String { "Android · \(device.model)" }
+        var title: String { "Android · \(device.name)" }
         var running: Bool { process?.isRunning == true }
     }
 
@@ -48,9 +49,11 @@ final class AndroidMirrors {
 
     var statusLines: [String] {
         mirrors.values.sorted { $0.device.key < $1.device.key }.map {
-            "\($0.device.model) (\($0.device.usb ? "USB" : "Wi-Fi"))" + ($0.running ? "" : ", not mirroring")
+            "\($0.device.name) (\($0.device.usb ? "USB" : "Wi-Fi"))" + ($0.running ? "" : ", not mirroring")
         }
     }
+
+    func name(of key: String) -> String { mirrors[key]?.device.name ?? key }
 
     func setEnabled(_ on: Bool) {
         enabled = on
@@ -90,7 +93,7 @@ final class AndroidMirrors {
             m.process?.terminate()
             mirrors[k] = nil
             changed = true
-            log("Android: \(m.device.model) disconnected")
+            log("Android: \(m.device.name) disconnected")
         }
         for var d in devices {
             if let m = mirrors[d.key] {
@@ -103,16 +106,16 @@ final class AndroidMirrors {
             } else {
                 mirrors[d.key] = Mirror(device: d)
                 changed = true
-                log("Android: \(d.model) connected (\(d.adbSerial))")
+                log("Android: \(d.name) connected (\(d.adbSerial))")
             }
         }
         if changed { onLayoutChange?() } else { relaunchStopped() }
     }
 
-    // Place each mirror; start scrcpy where it is not running.
-    func apply(_ layout: Layout) {
+    // Place each mirror (frames on the mirrors display, by device key); start scrcpy where it is not running.
+    func apply(_ frames: [String: CGRect]) {
         for m in mirrors.values {
-            guard let f = layout.mirrorFrames[m.device.key] else { continue }
+            guard let f = frames[m.device.key] else { continue }
             let moved = !AX.near(m.frame, f)
             m.frame = f
             if m.running {
@@ -158,7 +161,7 @@ final class AndroidMirrors {
         do {
             try p.run()
             m.process = p
-            log("Android: mirroring \(m.device.model) at \(NSStringFromRect(f))")
+            log("Android: mirroring \(m.device.name) at \(NSStringFromRect(f))")
         } catch {
             log("Android: scrcpy failed to start: \(error)")
         }
@@ -180,7 +183,7 @@ final class AndroidMirrors {
             if abs(aspect - m.device.aspect) / m.device.aspect > 0.05 {
                 m.device.aspect = aspect
                 rotated = true
-                log("Android: \(m.device.model) rotated")
+                log("Android: \(m.device.name) changed shape (rotated or folded)")
             } else {
                 AX.setFrame(w, m.frame)
             }
@@ -204,11 +207,21 @@ final class AndroidMirrors {
             let usb = props["usb"] != nil
             let model = (props["model"] ?? serial).replacingOccurrences(of: "_", with: " ")
             let aspect = knownAspects[serial] ?? screenAspect(serial) ?? 0.45
-            found.append(Device(adbSerial: serial, key: hardwareSerial(serial, usb: usb), model: model, usb: usb, aspect: aspect))
+            found.append(Device(adbSerial: serial, key: hardwareSerial(serial, usb: usb), model: model,
+                                name: deviceName(serial) ?? model, usb: usb, aspect: aspect))
         }
         var byKey: [String: Device] = [:]   // prefer USB when a phone is connected both ways
         for d in found where byKey[d.key] == nil || (d.usb && byKey[d.key]?.usb == false) { byKey[d.key] = d }
         return Array(byKey.values)
+    }
+
+    private var deviceNames: [String: String] = [:]   // touched only on adbQueue
+    private func deviceName(_ serial: String) -> String? {
+        if let n = deviceNames[serial] { return n }
+        guard let n = run(Config.adb, ["-s", serial, "shell", "settings", "get", "global", "device_name"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty, n != "null" else { return nil }
+        deviceNames[serial] = n
+        return n
     }
 
     private func hardwareSerial(_ serial: String, usb: Bool) -> String {

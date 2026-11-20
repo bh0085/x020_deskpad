@@ -1,5 +1,11 @@
 import AppKit
 
+// The virtual displays as one area: the agents' Mac display and the mirrors display.
+struct VirtualArea {
+    let rects: [CGRect]
+    func contains(_ p: CGPoint) -> Bool { rects.contains { $0.contains(p) } }
+}
+
 // ChromeGuard keeps Ben's Chrome usable while agents work in a Chrome window on DeskPad.
 // Chrome opens a new window next to its most recently active window, restores windows where they were, and on a
 // Dock click shows its existing windows; once the agent window lives on DeskPad, all three can happen out of sight.
@@ -14,7 +20,7 @@ import AppKit
 // Checks run when Chrome launches, activates, opens a window or changes its focused window, and on Dock clicks.
 final class ChromeGuard {
     static let chromeID = "com.google.Chrome"
-    let displayBounds: () -> CGRect?
+    let displayBounds: () -> VirtualArea?   // both virtual displays
     var agentZone: CGRect?
     private var agentPlacement: (zone: CGRect, result: CGRect)?   // where Chrome actually put the window last time
     var observer: AXObserver?
@@ -25,7 +31,7 @@ final class ChromeGuard {
     private var openedWindowAt = Date.distantPast
     private var lastUserSize: CGSize?         // size of Ben's own Chrome windows, for rescued windows
 
-    init(displayBounds: @escaping () -> CGRect?) {
+    init(displayBounds: @escaping () -> VirtualArea?) {
         self.displayBounds = displayBounds
         dockMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] e in self?.dockClick(e) }
         // Test hooks: the activation check without activating Chrome, and a sweep with a status line in the log.
@@ -202,7 +208,7 @@ final class ChromeGuard {
 
     // A window of Ben's on a desktop he is not looking at (the window server lists it; AX, which sees only the
     // current desktops, does not). Chrome keeps 1x1 and menu-bar windows around, so only real-sized ones count.
-    func userWindowOnOtherDesktop(deskpad: CGRect) -> Bool {
+    func userWindowOnOtherDesktop(deskpad: VirtualArea) -> Bool {
         let info = (CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]]) ?? []
         return info.contains { w in
             guard w[kCGWindowOwnerName as String] as? String == "Google Chrome", w[kCGWindowLayer as String] as? Int == 0,

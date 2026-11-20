@@ -16,7 +16,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let s = app.geometry.displaySize
+        let s = app.mac.size
         menu.addItem(NSMenuItem(title: "\(Config.displayName): \(Int(s.width)) × \(Int(s.height)) at 2x", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(toggle("Show Android devices", on: Config.showAndroid, #selector(toggleAndroid)))
