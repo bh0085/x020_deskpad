@@ -34,6 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.viewer?.portal.desktopChanged()
+            self?.viewer?.ensureRunning()
+        }
+        ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.viewer?.restart()
         }
         ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.viewer?.restart()

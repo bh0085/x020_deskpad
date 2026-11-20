@@ -169,14 +169,37 @@ final class Viewer: NSObject, SCStreamOutput, SCStreamDelegate {
         } catch { log("capture setup failed: \(error)") }
     }
 
-    // Rebuild the capture from scratch, e.g. after sleep, when the old stream may have died.
+    // Rebuild the capture from scratch, e.g. after sleep, when the old stream may have died. While the displays are
+    // asleep ScreenCaptureKit lists no displays, so keep retrying (2 s, doubling to 30 s) until it works.
+    private var restartPending = false
+    private var retryDelay: Double = 2
+
     func restart() {
+        guard !restartPending else { return }
+        restartPending = true
+        attemptRestart()
+    }
+
+    private func attemptRestart() {
         if running, let s = stream { s.stopCapture { _ in } }
         running = false; stream = nil
         Task { @MainActor in
-            do { try await prepare(); start() } catch { log("capture restart failed: \(error)") }
+            do {
+                try await prepare()
+                start()
+                restartPending = false
+                retryDelay = 2
+                log("capture restarted")
+            } catch {
+                log("capture restart failed (\(error.localizedDescription)); retrying in \(Int(retryDelay)) s")
+                let delay = retryDelay
+                retryDelay = min(retryDelay * 2, 30)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.attemptRestart() }
+            }
         }
     }
+
+    func ensureRunning() { if !running { restart() } }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sb.isValid,

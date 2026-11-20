@@ -6,8 +6,10 @@ import AppKit
 // - A standard Chrome window on DeskPad whose title does not start with "Claude agents" (the agent window's given
 //   name, AppleScript `set given name of window id N to "Claude agents"`) moves to the centre of the main display,
 //   unless the cursor is on DeskPad (Ben is working there through the view).
-// - A Dock click on Chrome when every Chrome window sits on DeskPad restores a minimized window or presses
-//   File > New Window, so the click always gives Ben a window on his screen.
+// - When Chrome comes to the front (Dock, Spotlight, Launchpad, Cmd-Tab, a link) and Ben has no Chrome window it can
+//   show him, Chrome would focus the agent window, out of sight, and his typing would land in the agents' tabs.
+//   ChromeGuard gives him a window on his screen instead: it restores a minimized one, moves a link's new tab out of
+//   the agent window into a window of its own, or presses File > New Window.
 // - The agent window fills the agent zone of the layout.
 // Checks run when Chrome launches, activates, opens a window or changes its focused window, and on Dock clicks.
 final class ChromeGuard {
@@ -18,13 +20,22 @@ final class ChromeGuard {
     var observer: AXObserver?
     var appElement: AXUIElement?
     var dockMonitor: Any?
+    private var tabTimer: Timer?
+    private var agentTabBaseline: Int?        // agent window's tab count, sampled every 2 s
+    private var openedWindowAt = Date.distantPast
+    private var lastUserSize: CGSize?         // size of Ben's own Chrome windows, for rescued windows
 
     init(displayBounds: @escaping () -> CGRect?) {
         self.displayBounds = displayBounds
         dockMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] e in self?.dockClick(e) }
-        // Test hook: the Dock-click check without a real Dock click.
+        // Test hooks: the activation check without activating Chrome, and a sweep with a status line in the log.
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.bh0085.deskpad.chromeDockCheck"), object: nil, queue: .main) { [weak self] _ in
-            self?.ensureWindowOnMainDisplay()
+            self?.ensureUserWindow(tabsBefore: nil)
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.bh0085.deskpad.chromeSweep"), object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            log("ChromeGuard: observing \(self.appElement != nil), \(self.chromeWindows.count) windows: \(self.chromeWindows.map { "\(AX.title($0) ?? "?") \(AX.frame($0).map(NSStringFromRect) ?? "?")" })")
+            self.sweep()
         }
         let nc = NSWorkspace.shared.notificationCenter
         func chrome(_ n: Notification) -> NSRunningApplication? {
@@ -38,7 +49,7 @@ final class ChromeGuard {
             if chrome(n) != nil { self?.detach() }
         }
         nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
-            if chrome(n) != nil { self?.check() }
+            if chrome(n) != nil { self?.chromeActivated() }
         }
         if let a = NSRunningApplication.runningApplications(withBundleIdentifier: Self.chromeID).first { attach(a, tries: 20) }
     }
@@ -66,6 +77,10 @@ final class ChromeGuard {
         }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
         observer = obs; appElement = el
+        tabTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self, let agent = self.chromeWindows.first(where: self.isAgent) else { return }
+            self.agentTabBaseline = self.tabCount(agent)
+        }
         // Session restore places windows over several seconds after launch.
         for d in [0.0, 2.0, 5.0, 10.0] { DispatchQueue.main.asyncAfter(deadline: .now() + d) { [weak self] in self?.sweep() } }
     }
@@ -73,6 +88,7 @@ final class ChromeGuard {
     func detach() {
         if let observer { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode) }
         observer = nil; appElement = nil
+        tabTimer?.invalidate(); tabTimer = nil
     }
 
     // Chrome may still be placing a new window when the notification arrives, so look twice.
@@ -92,8 +108,11 @@ final class ChromeGuard {
         for w in chromeWindows {
             // An unreadable title must never get the agent window moved.
             guard let title = AX.title(w), !title.hasPrefix(Config.agentWindowName), !AX.isMinimized(w),
-                  let f = AX.frame(w), deskpad.contains(CGPoint(x: f.midX, y: f.midY)) else { continue }
-            let target = mainDisplayTarget(for: f.size, offset: CGFloat(moved) * 24)
+                  let f = AX.frame(w) else { continue }
+            guard deskpad.contains(CGPoint(x: f.midX, y: f.midY)) else { lastUserSize = f.size; continue }
+            // A window Chrome cascaded from the agent window has the agent zone's size; give it Ben's usual size.
+            let size = (agentZone.map { f.width >= $0.width * 0.9 } ?? false) ? (lastUserSize ?? CGSize(width: 1600, height: 1100)) : f.size
+            let target = mainDisplayTarget(for: size, offset: CGFloat(moved) * 24)
             AX.setFrame(w, target)
             moved += 1
             log("moved Chrome window \"\(title)\" from DeskPad to \(NSStringFromRect(target))")
@@ -122,7 +141,8 @@ final class ChromeGuard {
     func dockClick(_ e: NSEvent) {
         guard let p = e.cgEvent?.location, isChromeDockItem(at: p) else { return }
         // A click that launches Chrome needs time for session restore before the check means anything.
-        for d in [0.5, 2.5, 5.0] { DispatchQueue.main.asyncAfter(deadline: .now() + d) { [weak self] in self?.ensureWindowOnMainDisplay() } }
+        let before = agentTabBaseline
+        for d in [0.5, 2.5, 5.0] { DispatchQueue.main.asyncAfter(deadline: .now() + d) { [weak self] in self?.ensureUserWindow(tabsBefore: before) } }
     }
 
     // The Dock autohides, so this works only at click time, when the item is on screen.
@@ -137,21 +157,75 @@ final class ChromeGuard {
         return false
     }
 
-    func ensureWindowOnMainDisplay() {
-        guard let appElement, let deskpad = displayBounds() else { return }
+    func chromeActivated() {
+        let before = agentTabBaseline
+        check()
+        for d in [0.35, 1.2] { DispatchQueue.main.asyncAfter(deadline: .now() + d) { [weak self] in self?.ensureUserWindow(tabsBefore: before) } }
+    }
+
+    // Make sure Chrome has a window Ben can see. `tabsBefore`: the agent window's tab count before Chrome came forward.
+    func ensureUserWindow(tabsBefore: Int?) {
+        guard Config.chromeGuard, let appElement, let deskpad = displayBounds() else { return }
+        if let cursor = CGEvent(source: nil)?.location, deskpad.contains(cursor) { return }   // Ben is working in the view
+        guard Date().timeIntervalSince(openedWindowAt) > 3 else { return }                    // one is on its way
+        let onDeskpad: (CGRect) -> Bool = { deskpad.contains(CGPoint(x: $0.midX, y: $0.midY)) }
+        // 1. A window on the current desktop: Chrome shows it.
         var minimized: AXUIElement?
-        for w in chromeWindows {
-            if AX.isMinimized(w) { if !isAgent(w) { minimized = w }; continue }
-            if let f = AX.frame(w), !deskpad.contains(CGPoint(x: f.midX, y: f.midY)) { return }
+        for w in chromeWindows where !isAgent(w) {
+            if AX.isMinimized(w) { minimized = w; continue }
+            if let f = AX.frame(w), !onDeskpad(f) { return }
         }
+        // 2. A minimized window: bring it back.
         if let minimized {
             AX.setMinimized(minimized, false)
-            log("Dock click on Chrome: restored a minimized window"); return
+            log("Chrome came forward: restored a minimized window"); return
         }
+        // 3. A window on another desktop: macOS switches there.
+        if userWindowOnOtherDesktop(deskpad: deskpad) { return }
+        // 4. A link opened from another app went into a new tab of the agent window: move that tab to its own window.
+        if let before = tabsBefore, let agent = chromeWindows.first(where: isAgent), let now = tabCount(agent), now > before,
+           let focused = AX.copy(appElement, kAXFocusedWindowAttribute), CFEqual(focused, agent),
+           let move = menuItem(appElement, menu: "Tab", item: "Move Tab to New Window") {
+            AXUIElementPerformAction(move, kAXPressAction as CFString)
+            agentTabBaseline = now - 1
+            openedWindowAt = Date()
+            log("Chrome came forward with a new tab in the agent window: moved it to a window of its own")
+            check(); return
+        }
+        // 5. Otherwise a new window; sweep() moves it off DeskPad.
         guard let item = menuItem(appElement, menu: "File", item: "New Window") else { log("Chrome's File > New Window not found"); return }
         AXUIElementPerformAction(item, kAXPressAction as CFString)
-        log("Dock click on Chrome with no window on the main display: opened a new window")
+        openedWindowAt = Date()
+        log("Chrome came forward with no window on Ben's screen: opened a new window")
         check()
+    }
+
+    // A window of Ben's on a desktop he is not looking at (the window server lists it; AX, which sees only the
+    // current desktops, does not). Chrome keeps 1x1 and menu-bar windows around, so only real-sized ones count.
+    func userWindowOnOtherDesktop(deskpad: CGRect) -> Bool {
+        let info = (CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]]) ?? []
+        return info.contains { w in
+            guard w[kCGWindowOwnerName as String] as? String == "Google Chrome", w[kCGWindowLayer as String] as? Int == 0,
+                  w[kCGWindowIsOnscreen as String] as? Bool != true,
+                  let name = w[kCGWindowName as String] as? String, !name.isEmpty, !name.hasPrefix(Config.agentWindowName),
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = b["X"], let y = b["Y"], let width = b["Width"], let height = b["Height"], width > 300, height > 200
+            else { return false }
+            return !deskpad.contains(CGPoint(x: x + width / 2, y: y + height / 2))
+        }
+    }
+
+    // Tabs are the radio buttons in the window's tab strip (an AXTabGroup about 7 levels down).
+    func tabCount(_ w: AXUIElement) -> Int? {
+        var queue: [(AXUIElement, Int)] = [(w, 0)]
+        while !queue.isEmpty {
+            let (e, depth) = queue.removeFirst()
+            if AX.copy(e, kAXRoleAttribute) as? String == "AXTabGroup" {
+                return (AX.copy(e, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter { AX.copy($0, kAXRoleAttribute) as? String == "AXRadioButton" }.count
+            }
+            if depth < 9 { for c in AX.copy(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] { queue.append((c, depth + 1)) } }
+        }
+        return nil
     }
 
     func menuItem(_ app: AXUIElement, menu: String, item: String) -> AXUIElement? {
