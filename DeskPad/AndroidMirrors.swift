@@ -196,10 +196,18 @@ final class AndroidMirrors {
     private func listDevices(knownAspects: [String: CGFloat]) -> [Device]? {
         guard let out = run(Config.adb, ["devices", "-l"]) else { return nil }
         var found: [Device] = []
+        var listed = Set<String>()
         for line in out.split(separator: "\n").dropFirst() {
             let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            guard parts.count >= 2, parts[1] == "device" else { continue }   // skip offline / unauthorized
+            guard parts.count >= 2 else { continue }
             let serial = parts[0]
+            listed.insert(serial)
+            if parts[1] == "offline" && serial.contains(":") {   // a Wi-Fi link that died; its phone may be back on a new port
+                _ = run(Config.adb, ["disconnect", serial])
+                listed.remove(serial)
+                continue
+            }
+            guard parts[1] == "device" else { continue }   // skip unauthorized and the like
             var props: [String: String] = [:]
             for p in parts.dropFirst(2) {
                 if let i = p.firstIndex(of: ":") { props[String(p[..<i])] = String(p[p.index(after: i)...]) }
@@ -212,7 +220,39 @@ final class AndroidMirrors {
         }
         var byKey: [String: Device] = [:]   // prefer USB when a phone is connected both ways
         for d in found where byKey[d.key] == nil || (d.usb && byKey[d.key]?.usb == false) { byKey[d.key] = d }
+        rememberApproved(Set(found.map(\.key)))
+        connectWireless(listed: listed)
         return Array(byKey.values)
+    }
+
+    // Phones that have approved this Mac's adb key (seen working over USB or Wi-Fi), by hardware serial.
+    private var approved: Set<String> { Set(UserDefaults.standard.stringArray(forKey: "approvedAndroidDevices") ?? []) }
+    private func rememberApproved(_ keys: Set<String>) {
+        let all = approved.union(keys)
+        if all != approved { UserDefaults.standard.set(all.sorted(), forKey: "approvedAndroidDevices") }
+    }
+
+    // Wi-Fi: every 10 s, look up phones advertising wireless debugging (mDNS) and connect to the approved ones that
+    // are not connected over Wi-Fi yet, including phones on USB, so pulling the cable switches the mirror to Wi-Fi.
+    // A phone's port changes when it reboots or rejoins Wi-Fi; this finds the new one. Phones that have never
+    // approved this Mac are left alone: connecting would put an "Allow debugging?" prompt on their screen.
+    // The approval given over USB covers Wi-Fi too; no pairing needed.
+    private var nextScan = Date.distantPast
+    private func connectWireless(listed: Set<String>) {
+        guard Date() >= nextScan else { return }
+        nextScan = Date().addingTimeInterval(10)
+        guard let out = run(Config.adb, ["mdns", "services"]) else { return }
+        let known = approved
+        for line in out.split(separator: "\n") where line.contains("_adb-tls-connect._tcp") {
+            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard parts.count >= 3, parts[0].hasPrefix("adb-") else { continue }
+            let name = parts[0], address = parts[2]
+            let hw = name.dropFirst(4).split(separator: "-").first.map(String.init) ?? ""
+            guard known.contains(hw), !listed.contains(address), !listed.contains(where: { $0.hasPrefix(name) }) else { continue }
+            if let r = run(Config.adb, ["connect", address]), r.contains("connected to") {
+                log("Android: connected \(hw) over Wi-Fi at \(address)")
+            }
+        }
     }
 
     private var deviceNames: [String: String] = [:]   // touched only on adbQueue
