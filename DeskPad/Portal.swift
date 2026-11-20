@@ -12,15 +12,17 @@ final class Portal {
     struct Region: Equatable {
         let panel: CGRect    // on Desktop 2, global top-left coordinates
         let target: CGRect   // the screen area it shows, global coordinates
+        var key: String? = nil   // the Android device it shows; nil for the Mac display
     }
 
     var regions: [Region] = [] { didSet { regionsChanged(oldValue) } }
     var isActive: () -> Bool = { false }   // Desktop 2 is showing
+    var onPress: ((Region) -> Void)?        // a mouse button went down on a panel's screen
     private(set) var inside: Region?
     private var monitors: [Any] = []
 
     init() {
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .leftMouseUp, .rightMouseUp]
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .leftMouseUp, .rightMouseUp, .leftMouseDown, .rightMouseDown]
         if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] e in self?.handle(e) }) { monitors.append(g) }
         if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] e in self?.handle(e); return e }) { monitors.append(l) }
     }
@@ -32,6 +34,10 @@ final class Portal {
         let buttonsDown = NSEvent.pressedMouseButtons != 0
         if inside == nil, let r = regions.first(where: { $0.target.contains(c) }) {
             inside = r   // already on a screen (DeskPad restarted, or something else moved the cursor there)
+        }
+        if e.type == .leftMouseDown || e.type == .rightMouseDown {
+            if let r = inside, r.target.contains(c) { onPress?(r) }
+            return
         }
         if let r = inside {
             guard !buttonsDown, let exit = exitPoint(r, c, dx: e.deltaX, dy: e.deltaY) else { return }
@@ -48,6 +54,7 @@ final class Portal {
     func click(at c: CGPoint) {
         guard inside == nil, let r = regions.first(where: { $0.panel.contains(c) }) else { return }
         stepIn(r, at: c)
+        onPress?(r)
     }
 
     private func stepIn(_ r: Region, at c: CGPoint) {

@@ -6,6 +6,10 @@ import AppKit
 // scrcpy runs with SDL_MAC_BACKGROUND_APP=1, so starting it never takes focus from Ben, and with
 // SDL_MAC_MOUSE_FOCUS_CLICKTHROUGH=1, so a click on a mirror reaches the phone even while scrcpy is in the background.
 // --no-power-on keeps a DeskPad start from waking every phone.
+// Each phone's screen state (awake or not) is read every 2 s. A sleeping phone wakes when Ben clicks its panel
+// (KEYCODE_WAKEUP over adb; scrcpy's touches don't wake a phone). Phones set to "minimize when asleep" shrink to a
+// tile in the corner of Desktop 2 while their screen is off. A phone that drops off adb (cable pulled, new Wi-Fi port)
+// keeps its panel for 90 s, marked as reconnecting, so the layout doesn't jump.
 final class AndroidMirrors {
     struct Device {
         let adbSerial: String   // adb's name for it: USB serial, ip:port, or Wi-Fi debugging name
@@ -21,6 +25,9 @@ final class AndroidMirrors {
         var process: Process?
         var frame: CGRect = .zero
         var launches: [Date] = []
+        var awake: Bool?          // screen on; nil until checked or while disconnected
+        var lostAt: Date?         // when adb lost the phone
+        var connected: Bool { lostAt == nil }
         init(device: Device) { self.device = device }
         var title: String { "Android · \(device.name)" }
         var running: Bool { process?.isRunning == true }
@@ -29,6 +36,10 @@ final class AndroidMirrors {
     private(set) var mirrors: [String: Mirror] = [:]
     private(set) var enabled: Bool
     var onLayoutChange: (() -> Void)?
+    var onStateChange: (() -> Void)?   // screen or connection state changed; labels only
+    static let reconnectGrace: TimeInterval = 90
+    private var powerTimer: Timer?
+    private var checkingPower = false
     private let adbQueue = DispatchQueue(label: "deskpad.adb")
     private var hardwareSerials: [String: String] = [:]   // touched only on adbQueue
     private var pollTimer: Timer?
@@ -43,13 +54,72 @@ final class AndroidMirrors {
         if enabled { startPolling() }
     }
 
-    var layoutItems: [(key: String, aspect: CGFloat)] {
-        mirrors.values.sorted { $0.device.key < $1.device.key }.map { ($0.device.key, $0.device.aspect) }
+    var sorted: [Mirror] { mirrors.values.sorted { $0.device.key < $1.device.key } }
+    // Phones shown full size in the row, and phones shrunk to corner tiles.
+    var layoutItems: [(key: String, aspect: CGFloat)] { sorted.filter { !isMinimized($0) }.map { ($0.device.key, $0.device.aspect) } }
+    var minimizedItems: [(key: String, aspect: CGFloat)] { sorted.filter(isMinimized).map { ($0.device.key, $0.device.aspect) } }
+
+    func minimizesWhenAsleep(_ key: String) -> Bool {
+        (UserDefaults.standard.dictionary(forKey: "minimizeWhenAsleep") as? [String: Bool])?[key] ?? false
+    }
+    func setMinimizesWhenAsleep(_ key: String, _ on: Bool) {
+        var d = (UserDefaults.standard.dictionary(forKey: "minimizeWhenAsleep") as? [String: Bool]) ?? [:]
+        d[key] = on
+        UserDefaults.standard.set(d, forKey: "minimizeWhenAsleep")
+        onLayoutChange?()
+    }
+    func isMinimized(_ m: Mirror) -> Bool { minimizesWhenAsleep(m.device.key) && m.connected && m.awake == false }
+
+    // A few words on the phone's state for its panel ("asleep, click to wake"), or nil when it is awake and connected.
+    func stateNote(_ key: String) -> String? {
+        guard let m = mirrors[key] else { return nil }
+        if !m.connected { return "reconnecting…" }
+        if m.awake == false { return "asleep, click to wake" }
+        return nil
     }
 
     var statusLines: [String] {
-        mirrors.values.sorted { $0.device.key < $1.device.key }.map {
-            "\($0.device.name) (\($0.device.usb ? "USB" : "Wi-Fi"))" + ($0.running ? "" : ", not mirroring")
+        sorted.map { "\($0.device.name) (\($0.device.usb ? "USB" : "Wi-Fi"))" + (stateNote($0.device.key).map { ", " + $0 } ?? "") }
+    }
+
+    // Wake a sleeping phone (KEYCODE_WAKEUP does nothing to a phone that is already awake).
+    func wake(_ key: String) {
+        guard let m = mirrors[key], m.connected, m.awake != true else { return }
+        let serial = m.device.adbSerial
+        log("Android: waking \(m.device.name)")
+        adbQueue.async {
+            _ = self.run(Config.adb, ["-s", serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP"])
+            DispatchQueue.main.async { self.checkPower() }
+        }
+    }
+
+    private func checkPower() {
+        guard !checkingPower else { return }
+        let targets = mirrors.values.filter(\.connected).map { ($0.device.key, $0.device.adbSerial) }
+        guard !targets.isEmpty else { return }
+        checkingPower = true
+        adbQueue.async {
+            var states: [String: Bool] = [:]
+            for (key, serial) in targets {
+                // mWakefulness is Awake, Asleep, Dozing (always-on display) or Dreaming (screensaver).
+                if let out = self.run(Config.adb, ["-s", serial, "shell", "dumpsys power | grep -m1 mWakefulness="]),
+                   let r = out.range(of: #"mWakefulness=\w+"#, options: .regularExpression) {
+                    states[key] = out[r].hasSuffix("=Awake")
+                }
+            }
+            DispatchQueue.main.async {
+                self.checkingPower = false
+                var layoutChanged = false, stateChanged = false
+                for (k, awake) in states {
+                    guard let m = self.mirrors[k], m.awake != awake else { continue }
+                    let wasMinimized = self.isMinimized(m)
+                    m.awake = awake
+                    stateChanged = true
+                    if self.isMinimized(m) != wasMinimized { layoutChanged = true }
+                    log("Android: \(m.device.name) \(awake ? "awake" : "asleep")")
+                }
+                if layoutChanged { self.onLayoutChange?() } else if stateChanged { self.onStateChange?() }
+            }
         }
     }
 
@@ -68,11 +138,13 @@ final class AndroidMirrors {
         poll()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
         rotationTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.checkWindows() }
+        powerTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.checkPower() }
     }
 
     private func stopPolling() {
         pollTimer?.invalidate(); pollTimer = nil
         rotationTimer?.invalidate(); rotationTimer = nil
+        powerTimer?.invalidate(); powerTimer = nil
     }
 
     func poll() {
@@ -87,16 +159,32 @@ final class AndroidMirrors {
 
     private func reconcile(_ devices: [Device]?) {
         guard enabled, let devices else { return }   // nil: adb itself failed; keep what we have
-        var changed = false
+        var changed = false, stateChanged = false
         let keys = Set(devices.map(\.key))
+        let now = Date()
         for (k, m) in mirrors where !keys.contains(k) {
-            m.process?.terminate()
-            mirrors[k] = nil
-            changed = true
-            log("Android: \(m.device.name) disconnected")
+            if let lost = m.lostAt {
+                if now.timeIntervalSince(lost) > Self.reconnectGrace {
+                    mirrors[k] = nil
+                    changed = true
+                    log("Android: \(m.device.name) gone; panel removed")
+                }
+            } else {
+                m.lostAt = now
+                m.awake = nil
+                m.process?.terminate()
+                stateChanged = true
+                log("Android: lost \(m.device.name); keeping its panel while it reconnects")
+            }
         }
         for var d in devices {
             if let m = mirrors[d.key] {
+                if m.lostAt != nil {
+                    m.lostAt = nil
+                    m.launches = []
+                    stateChanged = true
+                    log("Android: \(d.name) back (\(d.adbSerial))")
+                }
                 if m.device.adbSerial != d.adbSerial {   // switched between USB and Wi-Fi: mirror over the new link
                     d.aspect = m.device.aspect
                     m.device = d
@@ -109,7 +197,10 @@ final class AndroidMirrors {
                 log("Android: \(d.name) connected (\(d.adbSerial))")
             }
         }
-        if changed { onLayoutChange?() } else { relaunchStopped() }
+        if changed { onLayoutChange?() } else {
+            if stateChanged { onStateChange?() }
+            relaunchStopped()
+        }
     }
 
     // Place each mirror (frames on the mirrors display, by device key); start scrcpy where it is not running.
@@ -120,14 +211,14 @@ final class AndroidMirrors {
             m.frame = f
             if m.running {
                 if moved, let w = window(of: m) { AX.setFrame(w, f) }
-            } else {
+            } else if m.connected {
                 launch(m)
             }
         }
     }
 
     private func relaunchStopped() {
-        for m in mirrors.values where !m.running && m.frame != .zero { launch(m) }
+        for m in mirrors.values where !m.running && m.connected && m.frame != .zero { launch(m) }
     }
 
     private func launch(_ m: Mirror) {

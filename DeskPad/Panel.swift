@@ -14,8 +14,20 @@ final class Panel {
     let window: InertPanel
     let content = CALayer()
     let label: NSTextField
+    private let overlay = CATextLayer()
+    private let dim = CALayer()
     private(set) var rect: CGRect          // the screen part, global top-left coordinates
     var contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    // A corner card shows only its text, not the mirror.
+    var showsMirror = true {
+        didSet {
+            guard showsMirror != oldValue else { return }
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            if !showsMirror { content.contents = nil }
+            content.backgroundColor = showsMirror ? NSColor.black.cgColor : NSColor(white: 0.12, alpha: 0.92).cgColor
+            CATransaction.commit()
+        }
+    }
 
     init?(rect: CGRect, title: String, space: UInt64, onClick: @escaping (CGPoint) -> Void) {
         self.rect = rect
@@ -36,6 +48,15 @@ final class Panel {
         content.backgroundColor = NSColor.black.cgColor
         content.contentsGravity = .resize
         view.layer?.addSublayer(content)
+        dim.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        dim.isHidden = true
+        content.addSublayer(dim)
+        overlay.alignmentMode = .center
+        overlay.isWrapped = true
+        overlay.foregroundColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        overlay.contentsScale = 2
+        overlay.isHidden = true
+        content.addSublayer(overlay)
         label.font = .systemFont(ofSize: 15, weight: .medium)
         label.textColor = NSColor.white.withAlphaComponent(0.8)
         label.alignment = .center
@@ -70,12 +91,28 @@ final class Panel {
     private func layoutContents() {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         content.frame = CGRect(x: 0, y: Panel.labelHeight, width: rect.width, height: rect.height)
+        dim.frame = content.bounds
+        let fontSize: CGFloat = rect.height < 300 ? 13 : 17
+        overlay.fontSize = fontSize
+        overlay.font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        let textHeight = min(fontSize * 4, rect.height - 8)
+        overlay.frame = CGRect(x: 6, y: (rect.height - textHeight) / 2, width: rect.width - 12, height: textHeight)
         CATransaction.commit()
         label.frame = NSRect(x: 8, y: Panel.labelHeight - 42, width: rect.width - 16, height: 22)
         (window.contentView as? PanelView)?.screenRect = content.frame
     }
 
+    // Text over the screen (e.g. "Reconnecting…"), optionally dimming what is under it; nil removes it.
+    func setOverlay(_ text: String?, dim dimmed: Bool) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        overlay.string = text
+        overlay.isHidden = text == nil
+        dim.isHidden = !(text != nil && dimmed)
+        CATransaction.commit()
+    }
+
     func show(_ surface: IOSurface) {
+        guard showsMirror else { return }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         content.contents = surface
         content.contentsRect = contentsRect

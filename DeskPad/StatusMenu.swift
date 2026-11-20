@@ -22,8 +22,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(toggle("Show Android devices", on: Config.showAndroid, #selector(toggleAndroid)))
         if Config.showAndroid {
             let lines = app.android?.statusLines ?? []
-            for line in lines.isEmpty ? ["No devices connected"] : lines {
+            if lines.isEmpty { menu.addItem(NSMenuItem(title: "    No devices connected", action: nil, keyEquivalent: "")) }
+            for (line, m) in zip(lines, app.android?.sorted ?? []) {
                 menu.addItem(NSMenuItem(title: "    " + line, action: nil, keyEquivalent: ""))
+                let key = m.device.key
+                let t = toggle("        Minimize to the corner when asleep", on: app.android?.minimizesWhenAsleep(key) == true, #selector(toggleMinimize(_:)))
+                t.representedObject = key
+                menu.addItem(t)
             }
         }
         menu.addItem(toggle("Keep my Chrome windows off DeskPad", on: Config.chromeGuard, #selector(toggleChromeGuard)))
@@ -43,6 +48,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc func toggleAndroid() {
         Config.showAndroid.toggle()
         app.android?.setEnabled(Config.showAndroid)
+    }
+
+    @objc func toggleMinimize(_ item: NSMenuItem) {
+        guard let key = item.representedObject as? String, let android = app.android else { return }
+        android.setMinimizesWhenAsleep(key, !android.minimizesWhenAsleep(key))
     }
 
     @objc func toggleChromeGuard() {

@@ -48,6 +48,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         })
         android = AndroidMirrors(enabled: Config.showAndroid)
         android?.onLayoutChange = { [weak self] in self?.relayout() }
+        android?.onStateChange = { [weak self] in self?.updateLabels() }
+        portal.onPress = { [weak self] r in if let k = r.key { self?.android?.wake(k) } }
         portal.isActive = { [weak self] in self?.macPanel?.window.isOnActiveSpace == true }
         relayout()
 
@@ -87,34 +89,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func relayout() {
         guard let mac, let mirrors else { return }
-        let items = android?.enabled == true ? android?.layoutItems ?? [] : []
-        let l = Layout.compute(area: desktopArea, macSize: mac.size, devices: items, mirrors: mirrors.visibleBounds)
+        let on = android?.enabled == true
+        let l = Layout.compute(area: desktopArea, macSize: mac.size, devices: on ? android?.layoutItems ?? [] : [],
+                               minimized: on ? android?.minimizedItems ?? [] : [], mirrors: mirrors.visibleBounds)
+        layout = l
         if let space {
             if let p = macPanel { p.setRect(l.mac, title: macTitle) }
             else { macPanel = Panel(rect: l.mac, title: macTitle, space: space) { [weak self] c in self?.portal.click(at: c) } }
-            let keys = Set(l.devices.map(\.key))
+            let shown = l.devices + l.tiles
+            let keys = Set(shown.map(\.key))
             for (k, p) in devicePanels where !keys.contains(k) { p.close(); devicePanels[k] = nil }
-            for d in l.devices {
-                let title = android?.name(of: d.key) ?? d.key
-                guard let p = devicePanels[d.key] ?? Panel(rect: d.panel, title: title, space: space, onClick: { [weak self] c in self?.portal.click(at: c) }) else { continue }
-                p.setRect(d.panel, title: title)
+            for d in shown {
+                let key = d.key
+                guard let p = devicePanels[key] ?? Panel(rect: d.panel, title: "", space: space, onClick: { [weak self] c in self?.panelClicked(key, at: c) }) else { continue }
+                p.setRect(d.panel, title: p.label.stringValue)
                 // Half a point in from each edge, so texture filtering never pulls in what is next to the mirror.
                 p.contentsRect = unitRect(d.mirror.insetBy(dx: 0.5, dy: 0.5), in: mirrors.bounds)
                 if let s = mirrorsSurface { p.show(s) }
-                devicePanels[d.key] = p
+                devicePanels[key] = p
             }
         }
-        android?.apply(Dictionary(l.devices.map { ($0.key, $0.mirror) }, uniquingKeysWith: { a, _ in a }))
+        android?.apply(Dictionary((l.devices + l.tiles).map { ($0.key, $0.mirror) }, uniquingKeysWith: { a, _ in a }))
         var regions: [Portal.Region] = []
         if macPanel != nil { regions.append(.init(panel: l.mac, target: mac.bounds)) }
-        regions += l.devices.filter { devicePanels[$0.key] != nil }.map { .init(panel: $0.panel, target: $0.mirror) }
+        regions += l.devices.filter { devicePanels[$0.key] != nil }.map { .init(panel: $0.panel, target: $0.mirror, key: $0.key) }
         portal.regions = regions
+        updateLabels()
         chromeGuard?.agentZone = mac.visibleBounds
         chromeGuard?.placeAgentWindow()
-        if layout.map({ $0.mac != l.mac || $0.devices.map(\.panel) != l.devices.map(\.panel) }) ?? true {
-            log("layout: Mac \(NSStringFromRect(l.mac)); " + l.devices.map { "\(android?.name(of: $0.key) ?? $0.key) \(NSStringFromRect($0.panel))" }.joined(separator: "; "))
+        let summary = "Mac \(NSStringFromRect(l.mac)); " + l.devices.map { "\(android?.name(of: $0.key) ?? $0.key) \(NSStringFromRect($0.panel))" }.joined(separator: "; ")
+            + (l.tiles.isEmpty ? "" : "; minimized: " + l.tiles.map { android?.name(of: $0.key) ?? $0.key }.joined(separator: ", "))
+        if summary != lastLayoutSummary { log("layout: " + summary); lastLayoutSummary = summary }
+    }
+    private var lastLayoutSummary = ""
+
+    // A phone panel's label and overlay follow the phone's state: asleep (click to wake), reconnecting, or nothing.
+    func updateLabels() {
+        guard let android, let layout else { return }
+        let tiles = Set(layout.tiles.map(\.key))
+        for (key, p) in devicePanels {
+            let name = android.name(of: key), note = android.stateNote(key)
+            let reconnecting = android.mirrors[key]?.connected == false
+            p.showsMirror = !tiles.contains(key)
+            if tiles.contains(key) {
+                p.setRect(p.rect, title: "")
+                p.setOverlay(name + "\n" + (note ?? ""), dim: false)
+            } else {
+                if let s = mirrorsSurface { p.show(s) }
+                p.setRect(p.rect, title: name + (note.map { " · " + $0 } ?? ""))
+                p.setOverlay(reconnecting ? "Reconnecting…" : nil, dim: true)
+            }
         }
-        layout = l
+    }
+
+    // A click on a phone's panel or tile: step in (full panels) and wake the phone if it is asleep.
+    private func panelClicked(_ key: String, at c: CGPoint) {
+        if layout?.tiles.contains(where: { $0.key == key }) == true { android?.wake(key) }
+        else { portal.click(at: c) }
     }
 
     // A rect on a display as the part of that display's captured frame, in the layer's unit coordinates
